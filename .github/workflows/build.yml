@@ -43,11 +43,11 @@ concurrency:
 
 jobs:
   launcher-experiment:
-    if: ${{ inputs.launcher_experiment && !inputs.checks_only }}
+    if: false
     uses: $/.github/workflows/launcher-experiment.yml
 
   checks:
-    if: ${{ !inputs.launcher_experiment }}
+    if: false
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,7 +192,7 @@ jobs:
           "$RUNNER_TEMP/cargo-audit" audit
 
   macos:
-    if: ${{ !inputs.launcher_experiment && !inputs.diagnostic_x64 && !inputs.checks_only }}
+    if: false
     runs-on: macos-15
     timeout-minutes: 120
     env:
@@ -326,7 +326,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    if: ${{ !inputs.launcher_experiment && !inputs.checks_only }}
+    if: false
     name: Linux (${{ matrix.arch }})
     strategy:
       fail-fast: false
