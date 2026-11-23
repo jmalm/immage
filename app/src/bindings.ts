@@ -79,6 +79,8 @@ export const commands = {
 	mapSearchKeyRemove: () => __TAURI_INVOKE<null>("map_search_key_remove"),
 	exportImages: (job: number, items: ExportItem[], options: ExportOptions) => __TAURI_INVOKE<ExportReply>("export_images", { job, items, options }),
 	exportCancel: (job: number) => __TAURI_INVOKE<void>("export_cancel", { job }),
+	exportOriginals: (job: number, items: OriginalExportItem[], dir: string, subfolder: string | null, conflict: string) => __TAURI_INVOKE<ExportReply>("export_originals", { job, items, dir, subfolder, conflict }),
+	exportOriginalsExisting: (items: OriginalExportItem[], dir: string, subfolder: string | null) => __TAURI_INVOKE<ExistingFile[]>("export_originals_existing", { items, dir, subfolder }),
 	movePlan: (req: MoveRequest) => __TAURI_INVOKE<MovePlan>("move_plan", { req }),
 	moveFiles: (job: number, req: MoveRequest, copy: boolean, keepBoth: string[]) => __TAURI_INVOKE<MoveSummary>("move_files", { job, req, copy, keepBoth }),
 	moveCancel: (job: number) => __TAURI_INVOKE<void>("move_cancel", { job }),
@@ -442,6 +444,13 @@ export type ExportItem = {
 	created?: string | null,
 	conflict?: string | null,
 	frame?: Value | null,
+};
+
+export type OriginalExportItem = {
+	imgid: number,
+	version: number,
+	stem: string,
+	conflict?: string | null,
 };
 
 export type ExportOptions = {

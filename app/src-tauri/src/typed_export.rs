@@ -31,6 +31,16 @@ pub struct ExportItem {
     pub frame: Option<Value>,
 }
 
+#[derive(Default, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginalExportItem {
+    pub imgid: i64,
+    pub version: i64,
+    pub stem: String,
+    #[serde(default)]
+    pub conflict: Option<String>,
+}
+
 #[derive(Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportOptions {

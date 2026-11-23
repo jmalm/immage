@@ -7,6 +7,9 @@ what Immage's update banner shows under Release Notes.
 
 Improvements
 
+- **Copy original files on export:** Export can copy originals unchanged to a
+  folder with the latest selected version's XMP edits and mask data, preserve
+  the original extension, and use the export dialog's file-name patterns.
 - **Even panorama skies:** Panorama Merge now matches exposure, color and
   lens vignetting between the photos before blending, so skies and other
   smooth areas no longer show steps or bands where the photos overlap.

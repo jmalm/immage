@@ -1,7 +1,7 @@
 # Export
 
-Export writes finished photos to a folder, or uploads them into an Immich
-album, with your choice of size, format, file names, borders and captions.
+Export writes developed photos or copies original files to a folder, or
+uploads developed photos into an Immich album.
 
 **If you've used another editor:** it is the usual export dialog with
 presets on the left, plus a watermark and borders built in. Publishing to
@@ -51,6 +51,14 @@ For a folder:
   before anything is written.
 - **Show in Finder when done**.
 
+For **Original files**, the destination is a folder. The original file is
+copied unchanged, with the XMP edit and any mask data sidecars for the latest
+version in the export when available. If several versions of one photo are in
+the export scope, only one original file is copied, paired with the highest
+version's sidecars. File-name choices still apply; the original extension is
+kept and the sidecars are renamed to match. Existing-file choices apply to
+the original and its sidecars together.
+
 For Immich, choose an album, or **New album…**. A photo Immich already has
 goes into the album without a second copy. See [Immich](immich.md).
 
@@ -74,6 +82,23 @@ goes into the album without a second copy. See [Immich](immich.md).
 A date can take its own format: `{datecaptured:YYYY.MM}`. Characters a file
 name can't hold become `_`. The example line shows what the first file will
 be called.
+
+These naming choices apply to both developed images and original files. For
+originals, file bytes are not changed: the original extension is retained,
+and matching sidecars are renamed with it.
+
+## Original Files
+
+Choose **Original files** under **What to export** to copy source files
+unchanged to a folder. The selected version's XMP sidecar and any darktable
+mask data sidecar are copied when available and renamed to match the output
+file. When the scope contains multiple versions of one source photo, Immage
+copies the original once and uses the highest-version sidecars among those
+versions.
+
+Original-file export does not use format, size, frame, keyword or metadata
+settings. It is currently available only for folder destinations, not
+Immich albums.
 
 ## Format & Size
 
