@@ -47,6 +47,7 @@ export const EXPORT_FORMATS: readonly ExportFormat[] = ["jpeg", "tiff", "png", "
 const BIT_DEPTHS: readonly BitDepth[] = [8, 10, 12, 16];
 
 export type Settings = {
+  source: "developed" | "originals";
   dir: string;
   useSubfolder: boolean;
   subfolder: string;
@@ -92,7 +93,7 @@ export type Settings = {
 };
 
 export const DEFAULTS: Settings = {
-  dir: "", useSubfolder: false, subfolder: "Export", naming: "original", customName: "",
+  source: "developed", dir: "", useSubfolder: false, subfolder: "Export", naming: "original", customName: "",
   template: "{caption}-{datecaptured}",
   format: "jpeg", quality: 90, bpp: 8, colorSpace: "srgb", resize: false, longEdge: 2048, upscale: 0,
   canvas: false, canvasW: 1638, canvasH: 2048, canvasColor: "#ffffff", canvasFlip: false,
@@ -160,6 +161,7 @@ export const exportOptionsFor = (s: Pick<Settings, "format" | "quality" | "bpp">
 // a saved value that no longer means anything falls back to the default
 const sane = (s: Settings): Settings => ({
   ...s,
+  source: s.source === "originals" ? "originals" : "developed",
   format: EXPORT_FORMATS.includes(s.format) ? s.format : DEFAULTS.format,
   bpp: BIT_DEPTHS.includes(s.bpp) ? s.bpp : DEFAULTS.bpp,
 });
@@ -187,7 +189,7 @@ export const PRESET_KEYS = (Object.keys(DEFAULTS) as (keyof Settings)[]).filter(
 // how a photo leaves Immage, without where it goes: the builtins carry
 // these, so choosing one keeps the folder or album already chosen
 const OUTPUT: Partial<Settings> = {
-  naming: "original", format: "jpeg", quality: 90, bpp: 8, colorSpace: "srgb", resize: false, longEdge: 2048,
+  source: "developed", naming: "original", format: "jpeg", quality: 90, bpp: 8, colorSpace: "srgb", resize: false, longEdge: 2048,
   upscale: 0, canvas: false, canvasW: 1638, canvasH: 2048, canvasColor: "#ffffff", canvasFlip: false,
   borders: [], inner: [], texts: [], includeCamera: true, includeSerials: false, removeLocation: false,
   includeDescription: true, includeKeywords: true, includeHistory: false, keywords: [], keywordsOnOriginal: false,

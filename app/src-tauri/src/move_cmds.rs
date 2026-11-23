@@ -15,6 +15,7 @@ pub(crate) mod folder;
 
 use crate::immich_search::{self, PathMap};
 use crate::immich_upload;
+use crate::typed_export::{ExportFailure, ExportReply, ExistingFile, OriginalExportItem};
 use crate::volumes;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -1299,6 +1300,333 @@ pub(crate) fn move_cancel(state: State<'_, AppState>, job: u64) {
     }
 }
 
+fn original_sidecar(path: &Path, version: i64, extension: &str) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let versioned = if version > 0 {
+        match name.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}_{version:02}.{ext}"),
+            None => format!("{name}_{version:02}"),
+        }
+    } else {
+        name
+    };
+    path.with_file_name(format!("{versioned}.{extension}"))
+}
+
+fn original_output_name(source: &Path, stem: &str) -> String {
+    let safe: String = stem.chars()
+        .map(|c| if "/\\:*?\"<>|".contains(c) || c.is_control() { '_' } else { c })
+        .collect();
+    let safe = safe.trim_matches(['.', ' ']);
+    let stem = if safe.is_empty() { "image" } else { safe };
+    let ext = source.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    format!("{stem}{ext}")
+}
+
+fn original_targets(primary: &Path) -> Vec<PathBuf> {
+    ["xmp", "dtdata"].iter().fold(vec![primary.to_path_buf()], |mut paths, extension| {
+        let mut sidecar = primary.as_os_str().to_os_string();
+        sidecar.push(format!(".{extension}"));
+        paths.push(PathBuf::from(sidecar));
+        paths
+    })
+}
+
+fn numbered_original(name: &Path, n: u32) -> PathBuf {
+    let file = name.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let (stem, ext) = file.rsplit_once('.').map_or((file.as_str(), ""), |(a, _)| (a, &file[a.len()..]));
+    name.with_file_name(format!("{stem}-{n}{ext}"))
+}
+
+fn original_units(state: &AppState, items: Vec<OriginalExportItem>) -> Result<Vec<(Unit, Option<String>)>, String> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.imgid <= 0 || item.version < 0 {
+            return Err("original export needs a valid photo and version".into());
+        }
+        let meta = state.engine("export_originals").request(json!({ "cmd": "meta", "imgid": item.imgid }))?;
+        let path = meta["image"]["path"].as_str().filter(|p| !p.is_empty())
+            .ok_or("the engine gave no source path for an original export")?;
+        let path = PathBuf::from(path);
+        let source_meta = std::fs::metadata(&path)
+            .map_err(|e| transfer_io_error("inspect original", &path, e))?;
+        if !source_meta.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let reply = state.engine("export_originals").request(json!({ "cmd": "sidecars", "imgid": item.imgid }))?;
+        let sidecars = reply["files"].as_array()
+            .ok_or("the engine gave no sidecar list for an original export")?
+            .iter()
+            .map(|f| f.as_str().map(PathBuf::from)
+                .ok_or("the engine gave an invalid sidecar path for an original export"))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let file_name = original_output_name(&path, &item.stem);
+        let mut files = vec![UnitFile {
+            from: Some(path.clone()), rel: PathBuf::from(&file_name), size: source_meta.len(),
+        }];
+        for extension in ["xmp", "dtdata"] {
+            let wanted = original_sidecar(&path, item.version, extension);
+            let wanted_name = wanted.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let sidecar = sidecars.iter()
+                .find(|f| f.file_name().map(|n| n.to_string_lossy().to_lowercase()).as_deref() == Some(wanted_name.as_str()))
+                .cloned()
+                .map(|f| {
+                    let metadata = std::fs::metadata(&f)
+                        .map_err(|e| transfer_io_error("inspect edit sidecar", &f, e))?;
+                    if metadata.is_file() { Ok((f, metadata)) }
+                    else { Err(format!("{} is not a regular file", f.display())) }
+                })
+                .transpose()?;
+            if let Some((sidecar, metadata)) = sidecar {
+                let mut rel = PathBuf::from(&file_name).into_os_string();
+                rel.push(format!(".{extension}"));
+                files.push(UnitFile { from: Some(sidecar), rel: PathBuf::from(rel), size: metadata.len() });
+            }
+        }
+        out.push((Unit {
+            key: text(&path), name: file_name, imgids: vec![item.imgid], versions: 1,
+            files, download: None, keep_source: true, here: false,
+        }, item.conflict));
+    }
+    Ok(out)
+}
+
+fn original_stage_dir(dest: &Path) -> Result<PathBuf, String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let path = dest.join(format!(".immage-export-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(transfer_io_error("create export staging folder", &path, e)),
+        }
+    }
+    Err("could not reserve an original-export staging folder".into())
+}
+
+fn rollback_original_publish(placed: &[PathBuf], saved: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for path in placed.iter().rev() {
+        if let Err(e) = std::fs::remove_file(path) {
+            failures.push(transfer_io_error("remove incomplete export", path, e));
+        }
+    }
+    for (target, backup) in saved.iter().rev() {
+        if let Err(e) = std::fs::rename(backup, target) {
+            failures.push(transfer_io_error("restore overwritten export", target, e));
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+}
+
+fn target_exists(path: &Path) -> Result<bool, String> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(transfer_io_error("inspect export destination", path, e)),
+    }
+}
+
+fn copy_original_unit(unit: &Unit, dest: &Path, conflict: &str, cancel: &Arc<AtomicBool>) -> Result<Option<PathBuf>, String> {
+    if !matches!(conflict, "overwrite" | "skip" | "unique") {
+        return Err(format!("unknown original-export conflict choice '{conflict}'"));
+    }
+    let primary = PathBuf::from(&unit.name);
+    let mut selected = unit.clone();
+    let mut rel = file_names(&selected);
+    let mut targets = original_targets(&primary);
+    let mut reservation = None;
+    let mut chosen_conflict = conflict;
+
+    for n in 0..=10_000 {
+        if cancel.load(Ordering::SeqCst) { return Err(CANCELLED.into()); }
+        if n > 0 {
+            let numbered = numbered_original(&primary, n);
+            let name = numbered.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            selected.name = name.clone();
+            selected.files[0].rel = PathBuf::from(&name);
+            for file in selected.files.iter_mut().skip(1) {
+                let mut sidecar = PathBuf::from(&name).into_os_string();
+                sidecar.push(format!(".{}", file.rel.extension().unwrap_or_default().to_string_lossy()));
+                file.rel = PathBuf::from(sidecar);
+            }
+            rel = file_names(&selected);
+            targets = original_targets(&numbered);
+            chosen_conflict = "unique";
+        }
+
+        let mut exists = false;
+        for target in &targets {
+            exists |= target_exists(&dest.join(target))?;
+        }
+        if exists && chosen_conflict == "skip" { return Ok(None); }
+        if exists && chosen_conflict == "unique" { continue; }
+
+        reservation = DestinationReservation::try_new(dest, &targets, &selected);
+        if reservation.is_some() { break; }
+        if chosen_conflict == "skip" { return Ok(None); }
+        if chosen_conflict == "overwrite" {
+            return Err(format!("{} is in use by another transfer", dest.join(&primary).display()));
+        }
+    }
+    let Some(_reservation) = reservation else {
+        return Err("no unused numbered name is available for this original".into());
+    };
+
+    let stage = original_stage_dir(dest)?;
+    let mut retain_stage = false;
+    let result = (|| -> Result<(), String> {
+        let mut staged = Vec::with_capacity(selected.files.len());
+        for (i, file) in selected.files.iter().enumerate() {
+            if cancel.load(Ordering::SeqCst) { return Err(CANCELLED.into()); }
+            let source = file.from.as_ref().ok_or("original export has no source file")?;
+            let mut input = File::open(source).map_err(|e| transfer_io_error("open original", source, e))?;
+            let mtime = input.metadata().and_then(|m| m.modified()).ok();
+            let stage_file = stage.join(format!("copy-{i}"));
+            copy_verified(&mut input, &stage_file, None, mtime, &Ctx::new(cancel.clone()))?;
+            staged.push(stage_file);
+        }
+        if cancel.load(Ordering::SeqCst) { return Err(CANCELLED.into()); }
+
+        let mut saved = Vec::new();
+        for (i, target_rel) in targets.iter().enumerate() {
+            let target = dest.join(target_rel);
+            match target.symlink_metadata() {
+                Ok(meta) if !meta.file_type().is_file() => {
+                    let error = format!("{} is not a regular file", target.display());
+                    if let Err(rollback) = rollback_original_publish(&[], &saved) {
+                        retain_stage = true;
+                        return Err(format!("{error}; rollback failed: {rollback}"));
+                    }
+                    return Err(error);
+                }
+                Ok(_) => {
+                    let backup = stage.join(format!("backup-{i}"));
+                    if let Err(e) = std::fs::rename(&target, &backup) {
+                        let error = transfer_io_error("stage existing export", &target, e);
+                        if let Err(rollback) = rollback_original_publish(&[], &saved) {
+                            retain_stage = true;
+                            return Err(format!("{error}; rollback failed: {rollback}"));
+                        }
+                        return Err(error);
+                    }
+                    saved.push((target, backup));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    let error = transfer_io_error("inspect existing export", &target, e);
+                    if let Err(rollback) = rollback_original_publish(&[], &saved) {
+                        retain_stage = true;
+                        return Err(format!("{error}; rollback failed: {rollback}"));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let mut placed = Vec::new();
+        for (stage_file, target_rel) in staged.iter().zip(&rel) {
+            let target = dest.join(target_rel);
+            if let Err(e) = rename_no_replace(stage_file, &target) {
+                let error = transfer_io_error("publish original export", &target, e);
+                if let Err(rollback) = rollback_original_publish(&placed, &saved) {
+                    retain_stage = true;
+                    return Err(format!("{error}; rollback failed: {rollback}"));
+                }
+                return Err(error);
+            }
+            placed.push(target);
+        }
+        sync_dir(dest);
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        if retain_stage {
+            return Err(format!("{e}; staging folder retained at {}", stage.display()));
+        }
+        if let Err(cleanup) = std::fs::remove_dir_all(&stage) {
+            return Err(format!("{e}; could not clean staging folder {}: {cleanup}", stage.display()));
+        }
+        return Err(e);
+    }
+    std::fs::remove_dir_all(&stage)
+        .map_err(|e| format!("copied {}, but could not clean staging folder {}: {e}", dest.join(&selected.name).display(), stage.display()))?;
+    Ok(Some(dest.join(&selected.name)))
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn export_originals_existing(
+    state: State<'_, AppState>,
+    items: Vec<OriginalExportItem>,
+    dir: String,
+    subfolder: Option<String>,
+) -> Result<Vec<ExistingFile>, String> {
+    let units = original_units(&state, items)?;
+    let root = PathBuf::from(&dir);
+    let mut dest = root.clone();
+    if let Some(sub) = subfolder.filter(|s| !s.trim().is_empty()) { dest.push(sub.trim()); }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<ExistingFile>, String> {
+        if !volumes::answering(&root) { return Ok(Vec::new()); }
+        let mut files = Vec::with_capacity(units.len());
+        for (unit, _) in units {
+            let primary = PathBuf::from(&unit.name);
+            let paths = original_targets(&primary);
+            let mut exists = false;
+            for path in &paths { exists |= target_exists(&dest.join(path))?; }
+            files.push(ExistingFile { path: dest.join(primary).to_string_lossy().into_owned(), exists });
+        }
+        Ok(files)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn export_originals(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    job: u64,
+    items: Vec<OriginalExportItem>,
+    dir: String,
+    subfolder: Option<String>,
+    conflict: String,
+) -> Result<ExportReply, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.export_cancels.lock().unwrap().insert(job, cancel.clone());
+    let _registered = CancelEntry { map: &state.export_cancels, job };
+    let mut dest = PathBuf::from(&dir);
+    check_dest(&dest)?;
+    if let Some(sub) = subfolder.filter(|s| !s.trim().is_empty()) { dest.push(sub.trim()); }
+    std::fs::create_dir_all(&dest).map_err(|e| transfer_io_error("create export folder", &dest, e))?;
+    check_dest(&dest)?;
+    let units = original_units(&state, items)?;
+    let total = units.len();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut reply = ExportReply {
+            written: Vec::new(), skipped: Vec::new(), failed: Vec::<ExportFailure>::new(),
+            dir: Some(text(&dest)), cancelled: false, uploaded: None, duplicates: None, album: None,
+        };
+        for (i, (unit, item_conflict)) in units.into_iter().enumerate() {
+            if cancel.load(Ordering::SeqCst) {
+                reply.cancelled = true;
+                break;
+            }
+            let choice = item_conflict.as_deref().unwrap_or(&conflict);
+            match copy_original_unit(&unit, &dest, choice, &cancel) {
+                Ok(Some(path)) => reply.written.push(text(&path)),
+                Ok(None) => reply.skipped.push(text(&dest.join(&unit.name))),
+                Err(e) if e == CANCELLED => reply.cancelled = true,
+                Err(e) => reply.failed.push(ExportFailure { file: text(&dest.join(&unit.name)), error: e }),
+            }
+            let _ = app.emit("export-progress", json!({ "job": job, "done": i + 1, "total": total }));
+            if reply.cancelled { break; }
+        }
+        reply
+    }).await.map_err(|e| e.to_string())
+}
+
 #[derive(Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RenameItem {
@@ -2400,5 +2728,101 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         assert!(check_dest(&file).unwrap_err().contains("not a folder") || check_dest(&file).unwrap_err().contains("not answering"));
         assert!(check_dest(&d.join("nowhere")).is_err());
+    }
+
+    fn original_unit(
+        source: &Path,
+        xmp: Option<&Path>,
+        dtdata: Option<&Path>,
+        output_name: &str,
+    ) -> Unit {
+        let mut files = vec![UnitFile {
+            from: Some(source.to_path_buf()),
+            rel: PathBuf::from(output_name),
+            size: std::fs::metadata(source).unwrap().len(),
+        }];
+        for (extension, sidecar) in [("xmp", xmp), ("dtdata", dtdata)] {
+            if let Some(sidecar) = sidecar {
+                let mut rel = PathBuf::from(output_name).into_os_string();
+                rel.push(format!(".{extension}"));
+                files.push(UnitFile {
+                    from: Some(sidecar.to_path_buf()),
+                    rel: PathBuf::from(rel),
+                    size: std::fs::metadata(sidecar).unwrap().len(),
+                });
+            }
+        }
+        Unit {
+            key: text(source),
+            name: output_name.into(),
+            imgids: vec![1],
+            versions: 1,
+            files,
+            download: None,
+            keep_source: true,
+            here: false,
+        }
+    }
+
+    #[test]
+    fn original_names_keep_the_source_extension_and_versioned_sidecar_suffixes() {
+        let source = Path::new("IMG.CR3");
+        assert_eq!(original_sidecar(source, 0, "xmp"), PathBuf::from("IMG.CR3.xmp"));
+        assert_eq!(original_sidecar(source, 3, "xmp"), PathBuf::from("IMG_03.CR3.xmp"));
+        assert_eq!(original_sidecar(source, 3, "dtdata"), PathBuf::from("IMG_03.CR3.dtdata"));
+        assert_eq!(original_output_name(source, "edited name"), "edited name.CR3");
+    }
+
+    #[test]
+    fn original_keep_both_copies_the_raw_and_matching_xmp_without_changing_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source/IMG.CR3");
+        let sidecar = temp.path().join("source/IMG_03.CR3.xmp");
+        let data = temp.path().join("source/IMG_03.CR3.dtdata");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"raw bytes").unwrap();
+        std::fs::write(&sidecar, b"edit bytes").unwrap();
+        std::fs::write(&data, b"mask bytes").unwrap();
+        std::fs::write(dest.join("Renamed.CR3"), b"existing raw").unwrap();
+        std::fs::write(dest.join("Renamed.CR3.xmp"), b"existing edits").unwrap();
+        std::fs::write(dest.join("Renamed.CR3.dtdata"), b"existing masks").unwrap();
+
+        let unit = original_unit(&source, Some(&sidecar), Some(&data), "Renamed.CR3");
+        let written = copy_original_unit(&unit, &dest, "unique", &ctx()).unwrap().unwrap();
+
+        assert_eq!(written, dest.join("Renamed-1.CR3"));
+        assert_eq!(std::fs::read(&written).unwrap(), b"raw bytes");
+        assert_eq!(std::fs::read(dest.join("Renamed-1.CR3.xmp")).unwrap(), b"edit bytes");
+        assert_eq!(std::fs::read(dest.join("Renamed-1.CR3.dtdata")).unwrap(), b"mask bytes");
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw bytes");
+        assert_eq!(std::fs::read(&sidecar).unwrap(), b"edit bytes");
+        assert_eq!(std::fs::read(&data).unwrap(), b"mask bytes");
+        assert_eq!(std::fs::read(dest.join("Renamed.CR3")).unwrap(), b"existing raw");
+        assert_eq!(std::fs::read(dest.join("Renamed.CR3.xmp")).unwrap(), b"existing edits");
+        assert_eq!(std::fs::read(dest.join("Renamed.CR3.dtdata")).unwrap(), b"existing masks");
+    }
+
+    #[test]
+    fn original_overwrite_removes_a_stale_sidecar_when_source_has_no_xmp() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source/IMG.CR3");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"raw bytes").unwrap();
+        std::fs::write(dest.join("IMG.CR3"), b"old raw").unwrap();
+        std::fs::write(dest.join("IMG.CR3.xmp"), b"stale edits").unwrap();
+        std::fs::write(dest.join("IMG.CR3.dtdata"), b"stale masks").unwrap();
+
+        let unit = original_unit(&source, None, None, "IMG.CR3");
+        let written = copy_original_unit(&unit, &dest, "overwrite", &ctx()).unwrap().unwrap();
+
+        assert_eq!(written, dest.join("IMG.CR3"));
+        assert_eq!(std::fs::read(&written).unwrap(), b"raw bytes");
+        assert!(!dest.join("IMG.CR3.xmp").exists());
+        assert!(!dest.join("IMG.CR3.dtdata").exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"raw bytes");
     }
 }

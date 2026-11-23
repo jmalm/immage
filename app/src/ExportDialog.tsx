@@ -251,11 +251,17 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
   const items = s.scope === "shown" ? shown
     : s.scope === "selected" && selected.length > 1 ? selected
     : current ? [current] : [];
-  const upscale = canUpscale ? s.upscale : 0;
+  const originals = s.source === "originals";
+  const outputItems = originals ? [...items.reduce((byPath, image) => {
+    const previous = byPath.get(image.path);
+    if (!previous || (image.version ?? 0) > (previous.version ?? 0)) byPath.set(image.path, image);
+    return byPath;
+  }, new Map<string, ImageEntry>()).values()] : items;
+  const upscale = !originals && canUpscale ? s.upscale : 0;
   // what preparing is doing: downloading the upscale model
   const [note, setNote] = useState<string | null>(null);
   const busy = preparing;
-  const toImmich = s.target === "immich";
+  const toImmich = !originals && s.target === "immich";
   // a canvas is fitted by its longer side: the framed photo has its shape
   const canvas = s.canvas && !upscale;
   const longEdge = canvas ? Math.max(s.canvasW, s.canvasH) : s.resize && !upscale ? s.longEdge : null;
@@ -314,10 +320,11 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
     s.naming === "original" ? i.filename.replace(/\.[^.]+$/, "")
       : s.naming === "custom" ? `${s.customName.trim()}-${String(seq).padStart(3, "0")}`
       : expand(s.template, i, meta, seq, total, s.dateFormat);
+  const sourceSuffix = (filename: string) => filename.match(/\.[^.]+$/)?.[0] ?? "";
 
   // ---------------------------------------------------------- preview
   // the first photo the export covers, exported small with the same frame
-  const shownImage = items[0] ?? current;
+  const shownImage = (originals ? outputItems : items)[0] ?? current;
   const [previewMeta, setPreviewMeta] = useState<{ imgid: number; meta: Meta } | null>(null);
   useEffect(() => {
     if (!shownImage) return;
@@ -338,7 +345,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
   // before shows it without the engine
   const previewCache = useRef(new Map<string, string>());
   useEffect(() => {
-    if (!previewKey || busy || !shownImage) return;
+    if (originals || !previewKey || busy || !shownImage) return;
     const seq = ++previewSeq.current;
     const cached = previewCache.current.get(previewKey);
     if (cached) {
@@ -371,7 +378,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
       }
     }, 400);
     return () => window.clearTimeout(t);
-  }, [previewKey, busy]);
+  }, [originals, previewKey, busy]);
   useEffect(() => () => {
     for (const url of previewCache.current.values()) URL.revokeObjectURL(url);
     previewCache.current.clear();
@@ -386,6 +393,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
     setError(null);
     setPreparing(true);
     try {
+      if (originals && current && outputItems.some((i) => i.imgid === current.imgid)) await commands.save();
       // the upscale model, downloaded on first use
       if (upscale) {
         const stop = await listen<{ stage: string; mb?: number }>("ai-model", (e) => {
@@ -398,17 +406,21 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
       }
       // each image's metadata, when its name or its frame's text needs it
       const needMeta = s.naming === "template" || s.texts.length > 0;
-      const metas = await Promise.all(items.map(async (i) => !needMeta ? EMPTY_META
+      const metas = await Promise.all(outputItems.map(async (i) => !needMeta ? EMPTY_META
         : commands.meta(i.imgid).then((r) => r.image.metadata)));
-      const stems = items.map((i, k) => stemFor(i, metas[k], k + 1, items.length));
+      const stems = outputItems.map((i, k) => stemFor(i, metas[k], k + 1, outputItems.length));
       // files already there, or named twice in this export: what to do
       // with each, asked one at a time unless applied to all the rest
-      const conflicts: (Choice | null)[] = items.map(() => null);
+      const conflicts: (Choice | null)[] = outputItems.map(() => null);
       if (!toImmich && s.conflict === "ask") {
-        const files = await commands.exportExisting(items.map((i, k) => ({ imgid: i.imgid, stem: stems[k] })),
-          s.dir, s.useSubfolder ? s.subfolder : null, s.format);
+        const files = originals
+          ? await commands.exportOriginalsExisting(outputItems.map((i, k) => ({
+              imgid: i.imgid, version: i.version ?? 0, stem: stems[k],
+            })), s.dir, s.useSubfolder ? s.subfolder : null)
+          : await commands.exportExisting(outputItems.map((i, k) => ({ imgid: i.imgid, stem: stems[k] })),
+            s.dir, s.useSubfolder ? s.subfolder : null, s.format);
         // a short list means the destination did not answer; stop before anything is written
-        if (files.length !== items.length) {
+        if (files.length !== outputItems.length) {
           setError(t("dialogs.export.destinationNotAnswering", { dir: s.dir }));
           setPreparing(false);
           setNote(null);
@@ -422,7 +434,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
           return f.exists || twice;
         });
         let all: Choice | null = null;
-        for (let k = 0; k < items.length; k++) {
+        for (let k = 0; k < outputItems.length; k++) {
           if (!clash[k]) continue;
           if (!all) {
             const path = files[k].path, cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
@@ -439,7 +451,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
         }
       }
       const album = albums?.find((a) => a.id === s.album)?.name ?? "the album";
-      const total = items.length;
+      const total = outputItems.length;
       const summarize = (r: ExportReply) => {
         const failed = r.failed.length ? `, ${r.failed.length} failed: ${engineText(r.failed[0].error)}` : "";
         const stopped = r.cancelled ? "stopped: " : "";
@@ -450,10 +462,15 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
             + (r.skipped.length ? `, skipped ${r.skipped.length} already there` : "") + failed;
         return { text, ok: !r.failed.length && !r.skipped.length };
       };
-      const what = upscale ? `Upscaling ${upscale}× and exporting` : toImmich ? "Uploading" : "Exporting";
+      const what = originals ? "Copying originals" : upscale ? `Upscaling ${upscale}× and exporting` : toImmich ? "Uploading" : "Exporting";
       const reveal = s.reveal && !toImmich, keywordsChanged = s.keywordsOnOriginal && s.keywords.length > 0;
-      void runExport(what, total, (job) => commands.exportImages(job,
-        items.map((i, k) => ({ imgid: i.imgid, stem: stems[k], created: i.exif.datetime || null,
+      void runExport(what, total, (job) => originals
+        ? commands.exportOriginals(job,
+          outputItems.map((i, k) => ({ imgid: i.imgid, version: i.version ?? 0, stem: stems[k],
+                                       conflict: conflicts[k] ?? (s.conflict === "ask" ? "unique" : null) })),
+          s.dir, s.useSubfolder ? s.subfolder : null, s.conflict === "ask" ? "unique" : s.conflict)
+        : commands.exportImages(job,
+        outputItems.map((i, k) => ({ imgid: i.imgid, stem: stems[k], created: i.exif.datetime || null,
                                       conflict: conflicts[k] ?? (s.conflict === "ask" ? "unique" : null),
                                       frame: frameFor(s, i, metas[k]) as Value })),
         {
@@ -489,7 +506,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
     }
   };
 
-  const canRun = (toImmich ? !!s.album && albums?.some((a) => a.id === s.album) : !!s.dir) && items.length > 0 && !busy
+  const canRun = (toImmich ? !!s.album && albums?.some((a) => a.id === s.album) : !!s.dir) && outputItems.length > 0 && !busy
     && (s.naming !== "custom" || !!s.customName.trim()) && (s.naming !== "template" || !!s.template.trim());
 
   const conflictNames = { ask: t("dialogs.export.askMe"), unique: t("dialogs.export.addNumber"), overwrite: t("dialogs.export.replaceIt"), skip: t("dialogs.export.skipIt") };
@@ -588,12 +605,24 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
                      summary={toImmich ? t("dialogs.export.immichSummary", { album: albums?.find((a) => a.id === s.album)?.name ?? t("dialogs.export.noAlbum") })
                        : s.dir ? s.dir.split(/[/\\]/).pop() : t("dialogs.export.noFolder")}>
               <div className="row">
+                <span className="k">{t("dialogs.export.whatToExport")}</span>
+                <div className="segmented small">
+                  <button className={!originals ? "active" : ""} onClick={() => set("source", "developed")}>
+                    {t("dialogs.export.developedImage")}
+                  </button>
+                  <button className={originals ? "active" : ""} onClick={() => set("source", "originals")}>
+                    {t("dialogs.export.originalFiles")}
+                  </button>
+                </div>
+              </div>
+              {originals && <div className="note-plain">{t("dialogs.export.originalsHint")}</div>}
+              {!originals && <div className="row">
                 <span className="k">{t("dialogs.export.saveTo")}</span>
                 <div className="segmented small">
                   <button className={!toImmich ? "active" : ""} onClick={() => set("target", "folder")}>{t("dialogs.export.folder")}</button>
                   <button className={toImmich ? "active" : ""} onClick={() => set("target", "immich")}>{t("dialogs.export.immichAlbum")}</button>
                 </div>
-              </div>
+              </div>}
               {!toImmich ? (
                 <>
                   <div className="row">
@@ -691,11 +720,11 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
               {shownImage && s.naming !== "original" && (
                 <div className="example">e.g. {s.naming === "custom" && !s.customName.trim() ? "name-001"
                   : stemFor(shownImage, previewMeta?.meta ?? EMPTY_META, 1, items.length || 1)}
-                  .{ext(s.format)}</div>
+                  {originals ? sourceSuffix(shownImage.filename) : `.${ext(s.format)}`}</div>
               )}
             </Section>
 
-            <Section id="format" title={t("dialogs.export.formatSize")} open={openSections.format} onToggle={(alt) => toggle("format", alt)}
+            {!originals && <Section id="format" title={t("dialogs.export.formatSize")} open={openSections.format} onToggle={(alt) => toggle("format", alt)}
                      summary={`${formatNames[s.format]}${hasQuality(s.format) ? ` ${s.quality}` : ""}, `
                        + `${upscale ? `AI ${upscale}×` : canvas ? `canvas ${s.canvasW} × ${s.canvasH}` : s.resize ? `${s.longEdge} px` : "original size"}`}>
               <div className="row">
@@ -781,16 +810,16 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
                   {Object.entries(spaceNames).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
                 </select>
               </div>
-            </Section>
+            </Section>}
 
-            <Section id="frame" title={t("dialogs.export.frameCaptions")} open={openSections.frame} onToggle={(alt) => toggle("frame", alt)}
+            {!originals && <Section id="frame" title={t("dialogs.export.frameCaptions")} open={openSections.frame} onToggle={(alt) => toggle("frame", alt)}
                      summary={[s.borders.length && t("dialogs.export.frame"), s.inner.length && t("dialogs.export.keyline"),
                                s.texts.length && t("dialogs.export.captionCount", { count: s.texts.length })]
                        .filter(Boolean).join(", ") || t("dialogs.export.none")}>
               <FrameEditor s={s} set={set} />
-            </Section>
+            </Section>}
 
-            <Section id="keywords" title={t("dialogs.export.keywords")} open={openSections.keywords} onToggle={(alt) => toggle("keywords", alt)}
+            {!originals && <Section id="keywords" title={t("dialogs.export.keywords")} open={openSections.keywords} onToggle={(alt) => toggle("keywords", alt)}
                      summary={s.keywords.length
                        ? s.keywords.map((k) => k.slice(k.lastIndexOf("|") + 1)).join(", ")
                          + (s.keywordsOnOriginal ? " (also originals)" : "")
@@ -806,9 +835,9 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
               <div className="note-plain">{s.includeKeywords
                 ? t("dialogs.export.keywordsIncluded")
                 : t("dialogs.export.keywordsOmitted")}</div>
-            </Section>
+            </Section>}
 
-            <Section id="metadata" title={t("dialogs.export.metadata")} open={openSections.metadata} onToggle={(alt) => toggle("metadata", alt)}
+            {!originals && <Section id="metadata" title={t("dialogs.export.metadata")} open={openSections.metadata} onToggle={(alt) => toggle("metadata", alt)}
                      summary={metadataSummary(s)}>
               {METADATA.map(([label, on, flip]) => (
                 <label key={on} className="row check">
@@ -817,21 +846,24 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
                 </label>
               ))}
               <div className="note-plain">{t("dialogs.export.dateAlwaysIncluded")}</div>
-            </Section>
+            </Section>}
           </div>
 
           <div className="export-preview">
             <div className="preview-box">
-              {preview ? (
+              {originals ? (
+                <div className="note-plain">{t("dialogs.export.originalsHint")}</div>
+              ) : preview ? (
                 <img src={preview.url} className={preview.key !== previewKey ? "stale" : ""} alt="" />
               ) : (
                 <div className="note-plain">{shownImage ? t("dialogs.export.rendering") : t("dialogs.export.noPhoto")}</div>
               )}
             </div>
             <div className="preview-caption">
-              {previewError ? <span className="warn">{previewError}</span>
-                : shownImage ? <>{stemFor(shownImage, previewMeta?.meta ?? EMPTY_META, 1, items.length || 1)}
-                    .{ext(s.format)}{items.length > 1 ? t("dialogs.export.firstOf", { count: items.length }) : ""}</> : null}
+              {!originals && previewError ? <span className="warn">{previewError}</span>
+                : shownImage ? <>{stemFor(shownImage, previewMeta?.meta ?? EMPTY_META, 1, outputItems.length || 1)}
+                    {originals ? sourceSuffix(shownImage.filename) : `.${ext(s.format)}`}
+                    {outputItems.length > 1 ? t("dialogs.export.firstOf", { count: outputItems.length }) : ""}</> : null}
             </div>
           </div>
         </div>
@@ -855,7 +887,7 @@ export function ExportDialog({ current, selected, shown, canUpscale, onClose, on
           </div>
           <button className="btn" disabled={busy} onClick={onClose}>{t("dialogs.export.cancel")}</button>
           <button className="btn primary" disabled={!canRun} onClick={run}>
-            {busy ? t("dialogs.common.preparing") : t("dialogs.export.exportCount", { count: items.length })}
+            {busy ? t("dialogs.common.preparing") : t("dialogs.export.exportCount", { count: outputItems.length })}
           </button>
         </div>
       </div>
