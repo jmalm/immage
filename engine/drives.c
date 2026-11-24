@@ -45,6 +45,7 @@ struct drives_t
 // _import_lock lets one run at a time; the spare slots cost nothing
 #define _IMPORT_STALL_US (30 * G_USEC_PER_SEC)
 #define _IMPORT_SLOTS 8
+#ifndef _WIN32
 #define _TABLE_FRESH_US (10 * G_USEC_PER_SEC)
 
 typedef struct _mount_t
@@ -52,14 +53,17 @@ typedef struct _mount_t
   char *path;         // the mount point, or the key for a gvfs share
   gboolean holdable;  // FALSE for the system disk
 } _mount_t;
+#endif
 
 // LOCK ORDER: rank probe (8), as library.c's quarantine and probe locks, and
 // never held together with one of them: every function here takes it and
 // gives it back before returning, with no I/O inside
 static GMutex _lock;
 static GHashTable *_drives = NULL;   // mount -> drives_t *, never freed
+#ifndef _WIN32
 static GArray *_table = NULL;        // _mount_t, replaced whole
 static gint64 _table_read = 0;
+#endif
 static struct { drives_t *drive; gint64 started; gboolean logged; } _slots[_IMPORT_SLOTS];
 static char *_test_stall = NULL;     // IMMAGE_TEST_STALL_DIR
 
@@ -84,6 +88,7 @@ static gboolean _under(const char *path, const char *mount)
   return n == 0 || _is_sep(mount[n - 1]) || path[n] == '\0' || _is_sep(path[n]);
 }
 
+#ifndef _WIN32
 static void _table_free(GArray *t)
 {
   if(!t) return;
@@ -190,6 +195,7 @@ static GArray *_read_table(void)
   if(_test_stall) _add(t, _test_stall, TRUE);
   return t;
 }
+#endif
 
 #ifdef _WIN32
 // a drive by its name alone: X:\ or \\server\share\, upper-cased; NULL for
@@ -242,6 +248,7 @@ static drives_t *_drive_locked(const char *key)
   return d;
 }
 
+#ifndef _WIN32
 // the key a path's drive goes by, from the table, or NULL for the system
 // disk; *root is TRUE when the best match was not holdable, which may be a
 // drive the table does not have yet
@@ -271,6 +278,7 @@ static char *_lookup_locked(const char *path, gboolean *root)
 #endif
   return g_strdup(best->path);
 }
+#endif
 
 drives_t *drives_of(const char *path)
 {
